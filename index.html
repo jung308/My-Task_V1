@@ -1,0 +1,275 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>오늘의 할 일</title>
+<style>
+  :root { --bg:#f5f6f8; --card:#fff; --text:#222; --muted:#888; --accent:#4f6bed; --border:#e3e5ea; --danger:#e0524f; }
+  * { box-sizing: border-box; }
+  body { margin:0; font-family:-apple-system,"Segoe UI","Malgun Gothic",sans-serif; background:var(--bg); color:var(--text);
+         display:flex; justify-content:center; padding:40px 16px; }
+  .app { width:100%; max-width:520px; background:var(--card); border-radius:14px; box-shadow:0 4px 16px rgba(0,0,0,.06); padding:28px; }
+  h1 { font-size:22px; margin:0 0 4px; }
+  .date { color:var(--muted); font-size:14px; margin-bottom:20px; }
+  button { border:none; border-radius:8px; padding:10px 16px; font-size:14px; cursor:pointer; background:var(--accent); color:#fff; }
+  button:hover { opacity:.9; }
+  button:disabled { opacity:.5; cursor:default; }
+  form { display:flex; gap:8px; margin-bottom:16px; }
+  input[type="text"] { flex:1; padding:10px 12px; border:1px solid var(--border); border-radius:8px; font-size:15px; outline:none; }
+  input[type="text"]:focus { border-color:var(--accent); }
+  ul { list-style:none; padding:0; margin:0; }
+  li { display:flex; align-items:center; gap:10px; padding:12px 4px; border-bottom:1px solid var(--border); }
+  li input[type="checkbox"] { width:18px; height:18px; cursor:pointer; }
+  li span { flex:1; font-size:15px; word-break:break-word; }
+  .star { background:none; color:#c4c7cf; font-size:18px; padding:0 4px; line-height:1; }
+  .star.on { color:#f5b400; }
+  .carry { font-size:11px; color:#e0913a; border:1px solid #e0913a; border-radius:4px; padding:1px 5px; white-space:nowrap; }
+  .msg { color:var(--muted); font-size:14px; text-align:center; padding:24px 0; }
+  .error { color:var(--danger); font-size:14px; margin-top:12px; }
+  .toolbar { display:flex; justify-content:flex-end; margin-bottom:8px; }
+  .refresh { background:none; color:var(--accent); padding:4px 8px; font-size:13px; }
+  .hidden { display:none; }
+</style>
+</head>
+<body>
+<div class="app">
+  <h1>오늘의 할 일</h1>
+  <div class="date" id="date"></div>
+
+  <div id="loginArea">
+    <button id="loginBtn" disabled>구글 로그인</button>
+  </div>
+
+  <div id="mainArea" class="hidden">
+    <div class="toolbar"><button class="refresh" id="refreshBtn" type="button">새로고침</button></div>
+    <form id="addForm">
+      <input type="text" id="input" placeholder="할 일을 입력하세요" autocomplete="off">
+      <button type="submit">추가</button>
+    </form>
+    <ul id="list"></ul>
+    <div class="msg" id="msg"></div>
+  </div>
+
+  <div class="error" id="error"></div>
+</div>
+
+<script src="https://accounts.google.com/gsi/client" async defer></script>
+<script>
+  // ▼ 본인의 OAuth 클라이언트 ID
+  const CLIENT_ID = "142210678733-fk361dsglk2f2if45pis1nug6qf8ak6b.apps.googleusercontent.com";
+  const SCOPE = "https://www.googleapis.com/auth/tasks";
+  const LIST_URL = "https://tasks.googleapis.com/tasks/v1/lists/@default/tasks";
+
+  let accessToken = null;
+  let tokenClient = null;
+  let tasks = [];
+
+  const $ = id => document.getElementById(id);
+
+  // 로컬 날짜를 YYYY-MM-DD 문자열로 (구글 태스크의 due 날짜 형식과 맞춤)
+  function localDateStr(d = new Date()) {
+    const y = d.getFullYear();
+    const m = String(d.getMonth() + 1).padStart(2, "0");
+    const day = String(d.getDate()).padStart(2, "0");
+    return `${y}-${m}-${day}`;
+  }
+  const todayStr = () => localDateStr();
+
+  function showError(msg) { $("error").textContent = msg || ""; }
+
+  function setDate() {
+    $("date").textContent = new Date().toLocaleDateString("ko-KR",
+      { year:"numeric", month:"long", day:"numeric", weekday:"long" });
+  }
+
+  // 공통 API 호출 (401이면 세션 만료 처리)
+  async function api(path, options = {}) {
+    const res = await fetch(LIST_URL + path, {
+      ...options,
+      headers: {
+        Authorization: "Bearer " + accessToken,
+        ...(options.body ? { "Content-Type": "application/json" } : {}),
+      },
+    });
+    if (res.status === 401) {
+      accessToken = null;
+      $("mainArea").classList.add("hidden");
+      $("loginArea").classList.remove("hidden");
+      throw new Error("세션이 만료되었습니다. 다시 로그인해 주세요.");
+    }
+    if (!res.ok) throw new Error("HTTP " + res.status);
+    return res.status === 204 ? null : res.json();
+  }
+
+  function initAuth() {
+    if (!window.google || !google.accounts || !google.accounts.oauth2) {
+      setTimeout(initAuth, 200);
+      return;
+    }
+    tokenClient = google.accounts.oauth2.initTokenClient({
+      client_id: CLIENT_ID,
+      scope: SCOPE,
+      callback: resp => {
+        if (resp.error) { showError("로그인 실패: " + resp.error); return; }
+        accessToken = resp.access_token;
+        $("loginArea").classList.add("hidden");
+        $("mainArea").classList.remove("hidden");
+        loadTasks();
+      },
+    });
+    $("loginBtn").disabled = false;
+  }
+
+  $("loginBtn").addEventListener("click", () => {
+    showError("");
+    tokenClient.requestAccessToken({ prompt: "consent" });
+  });
+
+  // 미완료 항목 전체를 가져온 뒤, 오늘 또는 그 이전 마감(이월)만 보여준다
+  let loading = false;
+
+  async function loadTasks() {
+    if (!accessToken || loading) return;   // 로그인 전이거나 이미 불러오는 중이면 건너뜀
+    loading = true;
+    $("msg").textContent = "불러오는 중...";
+    showError("");
+    try {
+      const data = await api("?showCompleted=false&showHidden=false&maxResults=100");
+      tasks = data.items || [];
+      render();
+    } catch (e) {
+      showError("목록을 불러오지 못했습니다: " + e.message);
+      $("msg").textContent = "";
+    } finally {
+      loading = false;
+    }
+  }
+
+  function visibleTasks() {
+    const today = todayStr();
+    return tasks.filter(t => {
+      if (t.status === "completed") return false;
+      if (!t.due) return true;               // 마감이 없으면 오늘 할 일로 간주
+      return t.due.slice(0, 10) <= today;     // 오늘 또는 이월된 미완료 항목
+    });
+  }
+
+  function render() {
+    const list = $("list");
+    list.innerHTML = "";
+    // 중요(★) 항목을 위로, 나머지는 원래 순서 유지
+    const items = visibleTasks().sort((a, b) => Number(isStarred(b)) - Number(isStarred(a)));
+
+    items.forEach(t => {
+      const li = document.createElement("li");
+
+      const cb = document.createElement("input");
+      cb.type = "checkbox";
+      cb.addEventListener("change", () => completeTask(t, cb));
+
+      const star = document.createElement("button");
+      star.className = "star" + (isStarred(t) ? " on" : "");
+      star.textContent = isStarred(t) ? "★" : "☆";
+      star.title = "중요 표시";
+      star.addEventListener("click", () => toggleStar(t, star));
+
+      const span = document.createElement("span");
+      span.textContent = displayTitle(t);
+
+      li.append(cb, star, span);
+
+      if (t.due && t.due.slice(0, 10) < todayStr()) {
+        const badge = document.createElement("em");
+        badge.className = "carry";
+        badge.textContent = "지연업무";
+        li.appendChild(badge);
+      }
+      list.appendChild(li);
+    });
+
+    $("msg").textContent = items.length ? "" : "오늘 할 일이 없습니다. 위에서 추가해 보세요.";
+  }
+
+  // 중요 표시: 제목 앞의 "★ " 여부로 판단 (구글 태스크에도 그대로 저장됨)
+  const STAR = "★";
+  const isStarred = t => (t.title || "").startsWith(STAR);
+  const displayTitle = t => (t.title || "(제목 없음)").replace(/^★\s*/, "");
+
+  async function toggleStar(task, button) {
+    button.disabled = true;
+    showError("");
+    const newTitle = isStarred(task) ? displayTitle(task) : STAR + " " + displayTitle(task);
+    try {
+      const updated = await api("/" + encodeURIComponent(task.id), {
+        method: "PATCH",
+        body: JSON.stringify({ title: newTitle }),
+      });
+      task.title = updated.title;
+      render();
+    } catch (e) {
+      const msg = "중요 표시 변경에 실패했습니다: " + e.message;
+      await loadTasks();
+      showError(msg);
+    }
+  }
+
+  // 완료 처리: 구글 태스크에 completed 상태로 저장 → 앱 화면에서는 숨김
+  async function completeTask(task, checkbox) {
+    checkbox.disabled = true;
+    showError("");
+    try {
+      await api("/" + encodeURIComponent(task.id), {
+        method: "PATCH",
+        body: JSON.stringify({ status: "completed", completed: new Date().toISOString() }),
+      });
+      task.status = "completed";
+      render();
+    } catch (e) {
+      // 실패하면 최신 목록을 다시 불러와 상태를 맞추고 안내
+      const msg = "완료 처리에 실패했습니다: " + e.message;
+      await loadTasks();
+      showError(msg);
+    }
+  }
+
+  // 추가: 오늘 날짜(due)를 붙여서 구글 태스크에 생성
+  $("addForm").addEventListener("submit", async e => {
+    e.preventDefault();
+    const input = $("input");
+    const title = input.value.trim();
+    if (!title) return;
+    showError("");
+    try {
+      const created = await api("", {
+        method: "POST",
+        body: JSON.stringify({ title, due: todayStr() + "T00:00:00.000Z" }),
+      });
+      tasks.push(created);
+      input.value = "";
+      render();
+      input.focus();
+    } catch (e) {
+      showError("추가에 실패했습니다: " + e.message);
+    }
+  });
+
+  // 새로고침 버튼
+  $("refreshBtn").addEventListener("click", () => loadTasks());
+
+  // 탭이나 창으로 돌아올 때 자동 갱신 (휴대폰 등에서 바뀐 내용 반영)
+  document.addEventListener("visibilitychange", () => {
+    if (!document.hidden) loadTasks();
+  });
+  window.addEventListener("focus", () => loadTasks());
+
+  // 30초마다 자동 갱신 (로그인 상태이고 탭이 보이는 동안만)
+  setInterval(() => {
+    if (!document.hidden) loadTasks();
+  }, 30 * 1000);
+
+  setDate();
+  initAuth();
+</script>
+</body>
+</html>
